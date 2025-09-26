@@ -1,0 +1,337 @@
+#include BH1750.h
+#include DHT.h
+#include SoftwareSerial.h
+#include Servo.h
+#include Adafruit_NeoPixel.h
+
+ ====================== 핀 설정 ======================
+#define PIR_PIN 12
+#define DOOR_RELAY_PIN 5
+#define DOOR_SERVO_PIN 3
+#define BIRD_RELAY_PIN 13
+#define DHTPIN 7
+#define DHTTYPE DHT11
+#define FAN_RELAY 9
+#define NEO_PIN 2
+#define NEO_COUNT 8
+#define WATER_TRIG_PIN 4
+#define WATER_ECHO_PIN 8
+const float TANK_HEIGHT_CM = 13.0;
+
+ ====================== 객체 생성 ======================
+DHT dht(DHTPIN, DHTTYPE);
+SoftwareSerial BT(10, 11);   HC-06
+Servo doorServo;
+Servo birdServo;
+Adafruit_NeoPixel strip(NEO_COUNT, NEO_PIN, NEO_GRB + NEO_KHZ800);
+BH1750 lightMeter;
+
+ ====================== 전역 변수 ======================
+String neoState = AUTO;
+String fanState = OFF;    웹 상태 그대로
+String doorState = OFF;   AUTO  ON  OFF  IDLE
+String birdState = OFF;
+
+bool door_ch = false;  문 상태 체크하기용
+bool bird_ch = false;  bird 상태 체크하기용
+
+unsigned long lastSensorTime = 0;
+unsigned long lastBirdMove = 0;
+bool birdDirection = true;
+
+ ----- DOOR 관련 -----
+bool doorTriggered = false;     재트리거 방지
+bool doorAutoActive = false;    AUTO 동작 중
+unsigned long doorAutoStart = 0;
+const unsigned long DOOR_ON_DURATION = 700;  서보 동작 시간(ms)
+
+ ----- BIRD 관련 -----
+bool birdAutoActive = false;          AUTO 모드에서 3초 ON 동작 중
+unsigned long birdAutoStart = 0;      AUTO ON 시작 시각
+const unsigned long BIRD_ON_DURATION = 3000;  3초
+bool pirTriggered = false;            PIR 트리거 상태
+
+
+ DOOR 관련 전역 변수
+unsigned long lastSoilDoorTime = 0;   마지막 토양센서에 의한 문 열기 시간
+const unsigned long SOIL_DOOR_INTERVAL = 300000;  5분 (ms)
+
+
+ ====================== 초기화 ======================
+void setup() {
+  Serial.begin(9600);
+  BT.begin(9600);
+
+  pinMode(PIR_PIN, INPUT);
+  pinMode(FAN_RELAY, OUTPUT);
+  pinMode(DOOR_RELAY_PIN, OUTPUT);
+  pinMode(BIRD_RELAY_PIN, OUTPUT);
+
+  doorServo.attach(DOOR_SERVO_PIN);
+  doorServo.write(90);   초기 위치
+  doorServo.detach();
+
+
+  birdServo.write(0);
+  birdServo.detach();
+
+  dht.begin();
+  strip.begin();
+  strip.show();
+
+  pinMode(WATER_TRIG_PIN, OUTPUT);
+  pinMode(WATER_ECHO_PIN, INPUT);
+
+  Wire.begin();
+  lightMeter.begin();
+  lightMeter.configure(BH1750CONTINUOUS_HIGH_RES_MODE);
+}
+
+ ====================== 센서 측정 ======================
+float measureWaterLevel() {
+  digitalWrite(WATER_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(WATER_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(WATER_TRIG_PIN, LOW);
+
+  long duration = pulseIn(WATER_ECHO_PIN, HIGH, 30000);
+  if (duration == 0) return -1;
+  float distance = duration  0.034  2;
+  float level = TANK_HEIGHT_CM - distance;
+  return level  0  0  level;
+}
+
+
+void readSensors() {
+  if (millis() - lastSensorTime  10000) return;
+  lastSensorTime = millis();
+
+  int soil1 = analogRead(A0);
+  int soil2 = analogRead(A1);
+  int soil3 = analogRead(A2);
+  float temp = dht.readTemperature();
+  float hum = dht.readHumidity();
+  float lux = lightMeter.readLightLevel();
+  float waterLevel = measureWaterLevel();
+
+  String waterList = ;
+  int threshold = 500;
+  if (soil1  threshold) waterList += 1,;
+  if (soil2  threshold) waterList += 2,;
+  if (soil3  threshold) waterList += 3,;
+
+   👉 WATERLIST 처리
+  if (waterList.length()  0) {
+    waterList.remove(waterList.length() - 1);   마지막 쉼표 제거
+  } else {
+    waterList = STOP;   아무것도 없으면 STOP 전송
+  }
+
+  String data = P1 + String(soil1)
+              +  P2 + String(soil2)
+              +  P3 + String(soil3)
+              +  TEMP + String(temp)
+              +  HUM + String(hum)
+              +  LUX + String(lux)
+              +  WATER + String(int(waterLevel))
+              +  NEO + neoState
+              +  FAN + fanState
+              +  DOOR + doorState
+              +  BIRD + birdState
+              +  WATERLIST + waterList;
+
+  Serial.println(data);
+  BT.println(data);
+}
+
+
+ ====================== 블루투스 명령 처리 ======================
+void commandCheck() {
+  String cmd = ;
+
+   1️⃣ 블루투스 입력 확인
+  if (BT.available()) {
+    cmd = BT.readStringUntil('n');
+    cmd.trim();
+  }
+   2️⃣ 시리얼 모니터 입력 확인
+  else if (Serial.available()) {
+    cmd = Serial.readStringUntil('n');
+    cmd.trim();
+  }
+
+  if (cmd == ) return;   명령 없으면 종료
+ ===== DOOR 제어 =====
+if (cmd == DOOR_ON) doorState = ON;
+else if (cmd == DOOR_OFF) doorState = OFF;
+else if (cmd == DOOR_AUTO) doorState = AUTO;
+else if (cmd == DOOR_CLOSE) {
+    if(doorState == AUTO  doorState == IDLE){
+        Serial.println(DOOR_CLOSE received); 
+        digitalWrite(DOOR_RELAY_PIN, LOW);
+        delay(300);
+        doorServo.attach(DOOR_SERVO_PIN);
+        doorServo.write(110);
+        delay(DOOR_ON_DURATION);
+        digitalWrite(DOOR_RELAY_PIN, HIGH);
+        doorServo.detach();
+        doorState = IDLE;
+        door_ch = false;
+    }
+}
+else if (cmd == OPEN_DOOR) {   새 명령 추가
+    if(doorState == AUTO  doorState == IDLE) {
+        Serial.println(OPEN_DOOR received);
+        digitalWrite(DOOR_RELAY_PIN, LOW);
+        delay(300);
+        doorServo.attach(DOOR_SERVO_PIN);
+        doorServo.write(0);   문 열기
+        delay(DOOR_ON_DURATION);
+        digitalWrite(DOOR_RELAY_PIN, HIGH);
+        doorServo.detach();
+        doorState = IDLE;
+        door_ch = true;
+    }
+}
+
+   ===== FAN 제어 =====
+  else if (cmd == FAN_ON) fanState = ON;
+  else if (cmd == FAN_OFF) fanState = OFF;
+  else if (cmd == FAN_AUTO) fanState = AUTO;
+
+   ===== BIRD 제어 =====
+  else if (cmd == BIRD_ON) birdState = ON;
+  else if (cmd == BIRD_OFF) birdState = OFF;
+  else if (cmd == BIRD_AUTO) birdState = AUTO;
+
+   ===== NEO 제어 =====
+  else if (cmd == NEO_ON) neoState = ON;
+  else if (cmd == NEO_OFF) neoState = OFF;
+  else if (cmd == NEO_AUTO) neoState = AUTO;
+}
+
+ ====================== DOOR 제어 ======================
+void doorControl(int soil1, int soil2, int soil3) {
+    unsigned long now = millis();
+
+     OPEN_DOOR 명령으로만 문을 열도록 AUTO 모드 감지 제거
+    if (doorState == ON) {
+        digitalWrite(DOOR_RELAY_PIN, LOW);
+        delay(300);
+        doorServo.attach(DOOR_SERVO_PIN);
+        doorServo.write(110);
+        delay(DOOR_ON_DURATION);
+        digitalWrite(DOOR_RELAY_PIN, HIGH);
+        doorServo.detach();
+        doorState = IDLE;
+        door_ch = false;
+    } 
+    else if (doorState == OFF) {
+        digitalWrite(DOOR_RELAY_PIN, LOW);
+        delay(300);
+        doorServo.attach(DOOR_SERVO_PIN);
+        doorServo.write(0);
+        delay(DOOR_ON_DURATION);
+        digitalWrite(DOOR_RELAY_PIN, HIGH);
+        doorServo.detach();
+        doorState = IDLE;
+        door_ch = true;
+    }
+     AUTO 모드는 이제 OPEN_DOOR 명령으로만 처리
+}
+
+
+ ====================== NEO 제어 ======================
+void neoControl(float lux, float waterLevel) {
+  if (neoState == ON) for(int i=0;iNEO_COUNT;i++) strip.setPixelColor(i, strip.Color(0,255,0));
+  else if (neoState == OFF) for(int i=0;iNEO_COUNT;i++) strip.setPixelColor(i,0);
+  else if (neoState == AUTO) {
+    if(waterLevel=0 && waterLevel=3) for(int i=0;iNEO_COUNT;i++) strip.setPixelColor(i, strip.Color(255,0,0));
+    else if(lux=30) for(int i=0;iNEO_COUNT;i++) strip.setPixelColor(i, strip.Color(0,255,0));
+    else for(int i=0;iNEO_COUNT;i++) strip.setPixelColor(i,0);
+  }
+  strip.show();
+} ====================== BIRD 제어 ======================
+void birdControl() {
+  unsigned long now = millis();
+  bool pirDetected = digitalRead(PIR_PIN);   PIR HIGH 감지
+
+   ----- AUTO 모드 -----
+  if (birdState == AUTO) {
+     PIR 센서가 감지되었고, 이전 트리거가 없고, 부저가 OFF 상태일 때
+    if (pirDetected && !pirTriggered && !birdAutoActive) {
+      pirTriggered   = true;              
+      birdAutoActive = true;
+      birdAutoStart  = now;
+
+      digitalWrite(BIRD_RELAY_PIN, LOW);   부저 ON (삐~~~)
+    }
+
+     부저 ON 상태 유지
+    if (birdAutoActive) {
+      if (now - birdAutoStart = BIRD_ON_DURATION) {  3초 후 OFF
+        digitalWrite(BIRD_RELAY_PIN, HIGH);          부저 OFF
+        birdAutoActive = false;
+      }
+    }
+
+     PIR 센서 감지 해제 시 트리거 초기화
+    if (!pirDetected) {
+      pirTriggered = false;
+    }
+  }
+
+   ----- ON 모드 -----
+  else if (birdState == ON) {
+    digitalWrite(BIRD_RELAY_PIN, LOW);    계속 부저 ON
+  }
+
+   ----- OFF 모드 -----
+  else {  OFF
+    digitalWrite(BIRD_RELAY_PIN, HIGH);   항상 부저 OFF
+    birdAutoActive = false;
+  }
+}
+
+
+
+ ====================== FAN 제어 ======================
+void fanControl(float temp) {
+  if(fanState==ON) digitalWrite(FAN_RELAY, LOW);
+  else if(fanState==OFF) digitalWrite(FAN_RELAY, HIGH);
+  else if(fanState==AUTO) digitalWrite(FAN_RELAY, temp=28.0  LOW  HIGH);
+}
+
+ ====================== 메인 루프 ======================
+void loop() {
+   1️ 먼저 센서 읽고 기본 전송
+  readSensors();
+  commandCheck();   BT + 시리얼 명령 처리
+
+   2️ 각종 상태 읽기
+  int soil1 = analogRead(A0);
+  int soil2 = analogRead(A1);
+  int soil3 = analogRead(A2);
+  float lux = lightMeter.readLightLevel();
+  float waterLevel = measureWaterLevel();
+  float temp = dht.readTemperature();
+
+   3️ 장치 제어
+  fanControl(temp);
+  neoControl(lux, waterLevel);
+  doorControl(soil1, soil2, soil3);
+  birdControl();
+
+   4️ 문이 AUTO로 열렸다면, 열림 직후 상태 다시 전송
+  static bool sentAfterDoor = false;  문 열림 후 전송 체크
+  if (door_ch && !sentAfterDoor) {    door_ch = true → 문 열림 완료
+    readSensors();                    한 번 더 전송
+    sentAfterDoor = true;             다시 전송 방지
+  } 
+  else if (!door_ch) {                문 닫히면 플래그 초기화
+    sentAfterDoor = false;
+  }
+
+  delay(50);
+}

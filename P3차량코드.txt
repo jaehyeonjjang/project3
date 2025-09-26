@@ -1,0 +1,240 @@
+#define PUMP_PIN 4
+// 자동차 코드
+// ====== 모터 제어 핀 (L298N) ======
+const int ENA = 11;
+const int IN1 = 10;
+const int IN2 = 9;
+
+const int WATER_TIME = 3000;       // 3초 펌프
+const int WAIT_BEFORE_PUMP = 1000; // 1초 대기
+const int WAIT_AFTER_PUMP = 500;   // 0.5초 대기
+
+// ====== 상태 ======
+enum StepState {IDLE, MOVING, WAIT_BEFORE_PUMP_STATE, PUMPING, WAIT_AFTER_PUMP_STATE};
+StepState step = IDLE;
+unsigned long stepStartTime = 0;  // 상태 시작 시간
+
+// ====== MOVE 명령 큐 ======
+int potQueue[3];
+int potCount = 0;
+int potIndex = 0;
+
+// ====== 현재 위치 ======
+int currentPos = 0; // 시작은 0
+
+// ====== 펄스 이동 관련 객체 ======
+struct PulseMotor {
+  int enaPin;
+  int in1Pin;
+  int in2Pin;
+  int speed;
+  int pulseDuration; // ms
+};
+
+PulseMotor motor = {ENA, IN1, IN2, 200, 100};      // 200(속도)100(거리)
+
+// ====== 화분 간 펄스 횟수 매핑 ======
+int pulseMap[4][4] = {
+  {0, 2, 3, 4},
+  {2, 0, 1, 2},
+  {3, 1, 0, 2},
+  {4, 2, 1, 0}
+};
+
+// ====== 비동기 이동 변수 ======
+int pulsesToMove = 0; // 이동해야 할 펄스 수
+int pulsesMoved = 0;  // 이동 완료된 펄스 수
+int targetPos = 0;    // 현재 이동 목표 위치
+bool forward = true;  // 이동 방향 (전진/후진)
+
+// ====== 1펄스 논블로킹 이동 변수 ======
+bool pulseActive = false;
+bool pulseDirection = true;
+unsigned long pulseStartTime = 0;
+
+// ====== 1펄스 이동 함수 ======
+void startPulse(bool dir) {
+  pulseActive = true;
+  pulseDirection = dir;
+  pulseStartTime = millis();
+
+  analogWrite(motor.enaPin, motor.speed);
+  if (dir) {
+    digitalWrite(motor.in1Pin, LOW);
+    digitalWrite(motor.in2Pin, HIGH);
+  } else {
+    digitalWrite(motor.in1Pin, HIGH);
+    digitalWrite(motor.in2Pin, LOW);
+  }
+}
+
+void updatePulse() {
+  if (!pulseActive) return;
+
+  unsigned long elapsed = millis() - pulseStartTime;
+  if (elapsed >= motor.pulseDuration) {
+    analogWrite(motor.enaPin, 0);
+    digitalWrite(motor.in1Pin, LOW);
+    digitalWrite(motor.in2Pin, LOW);
+    pulseActive = false;
+    pulsesMoved++;
+  }
+}
+
+// ====== 펌프 함수 ======
+void startPump(int pot) {
+  digitalWrite(PUMP_PIN, HIGH);
+  Serial.print("펌프 ON 화분: "); Serial.println(pot);
+}
+
+void stopPump() {
+  digitalWrite(PUMP_PIN, LOW);
+  Serial.println("펌프 OFF");
+}
+
+// ====== 중간 목표 계산 ======
+int nextIntermediate(int from, int to) {
+  if (abs(to - from) <= 1) return to;        // 바로 이동 가능
+  return (from < to) ? from + 1 : from - 1;  // 한 칸씩 이동
+}
+
+// ====== MOVE 명령 처리 ======
+void handleMoveCommand(String cmd) {
+  cmd.trim();
+  potCount = 0;
+  potIndex = 0;
+
+  int start = 5;
+  while (start < cmd.length()) {
+    int comma = cmd.indexOf(',', start);
+    String numStr;
+    if (comma == -1) {
+      numStr = cmd.substring(start);
+      start = cmd.length();
+    } else {
+      numStr = cmd.substring(start, comma);
+      start = comma + 1;
+    }
+    numStr.trim();
+    int pot = numStr.toInt();
+    if (pot >= 1 && pot <= 3) {
+      potQueue[potCount++] = pot;
+    }
+  }
+
+  Serial.print("MOVE 명령 처리: ");
+  for (int i = 0; i < potCount; i++) {
+    Serial.print(potQueue[i]);
+    if (i < potCount - 1) Serial.print(",");
+  }
+  Serial.println();
+
+  if (potCount > 0) {
+    targetPos = nextIntermediate(currentPos, potQueue[potIndex]);
+    forward = (targetPos > currentPos);
+    pulsesToMove = pulseMap[currentPos][targetPos];
+    pulsesMoved = 0;
+    step = MOVING;
+  }
+}
+
+// ====== setup ======
+void setup() {
+  Serial.begin(9600);
+  while(!Serial); // USB 시리얼 연결 대기
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(PUMP_PIN, OUTPUT);
+  analogWrite(ENA, 0);
+  digitalWrite(PUMP_PIN, LOW);
+  Serial.println("자동화 화분 시스템 준비 완료!");
+}
+
+// ====== loop ======
+void loop() {
+  // ===== 시리얼 버퍼 정리 =====
+  while (Serial.available()) Serial.read();
+
+  // 시리얼 명령 처리
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.startsWith("MOVE:")) {
+      handleMoveCommand(cmd);
+    }
+  }
+
+  switch(step) {
+    case IDLE:
+      break;
+
+    case MOVING:
+      if (!pulseActive && pulsesMoved < pulsesToMove) {
+        startPulse(forward);
+      }
+      updatePulse();
+
+      if (!pulseActive && pulsesMoved >= pulsesToMove) {
+        currentPos = targetPos;
+
+        // 다음 중간 위치 체크
+        if (currentPos != potQueue[potIndex]) {
+          // 중간 화분으로 이동
+          targetPos = nextIntermediate(currentPos, potQueue[potIndex]);
+          forward = (targetPos > currentPos);
+          pulsesToMove = pulseMap[currentPos][targetPos];
+          pulsesMoved = 0;
+          stepStartTime = millis();
+          // 필요하면 중간 멈춤 처리 (펌프 OFF 상태)
+          Serial.print("중간 위치 도착: "); Serial.println(currentPos);
+        } else {
+          // 최종 화분 도착
+          stepStartTime = millis();
+          step = WAIT_BEFORE_PUMP_STATE;
+        }
+      }
+      break;
+
+    case WAIT_BEFORE_PUMP_STATE:
+      if (millis() - stepStartTime >= WAIT_BEFORE_PUMP) {
+        if (currentPos != 0) startPump(currentPos); // 0번 위치에서는 펌프 OFF
+        stepStartTime = millis();
+        step = (currentPos != 0) ? PUMPING : WAIT_AFTER_PUMP_STATE;
+      }
+      break;
+
+    case PUMPING:
+      if (millis() - stepStartTime >= WATER_TIME) {
+        stopPump();
+        stepStartTime = millis();
+        step = WAIT_AFTER_PUMP_STATE;
+      }
+      break;
+
+    case WAIT_AFTER_PUMP_STATE:
+      if (millis() - stepStartTime >= WAIT_AFTER_PUMP) {
+        if (currentPos != 0) Serial.print("WATER:"); Serial.println(currentPos);
+        potIndex++;
+        if (potIndex < potCount) {
+          targetPos = nextIntermediate(currentPos, potQueue[potIndex]);
+          forward = (targetPos > currentPos);
+          pulsesToMove = pulseMap[currentPos][targetPos];
+          pulsesMoved = 0;
+          step = MOVING;
+        } else if (currentPos != 0) {
+          targetPos = 0;
+          forward = (targetPos > currentPos);
+          pulsesToMove = pulseMap[currentPos][targetPos];
+          pulsesMoved = 0;
+          step = MOVING;
+          potIndex = 0;
+          potCount = 0;
+        } else {
+          step = IDLE;
+          Serial.println("DOOR_CLOSE");
+        }
+      }
+      break;
+  }
+}

@@ -1,0 +1,416 @@
+import serial, threading, time, csv, os, requests, shutil, cv2
+from datetime import datetime
+from flask import Flask,render_template_string,redirect,url_for,request
+
+app = Flask(__name__)
+# ===================== Sensor & Relay =====================
+sensor_data = {
+    'P1': 0,
+    'P2': 0,
+    'P3': 0,
+    'TEMP': 0.0,
+    'HUM': 0.0,
+    'LUX': 0.0,
+    'WATER': "STOP",
+    'WATERLIST': ""
+}
+
+relay_status = {
+    'FAN': 'OFF',
+    'DOOR': 'OFF',
+    'BIRD': 'OFF',
+    'NEO': 'OFF'
+}
+arduino_status = relay_status.copy()
+web_status = relay_status.copy()
+
+# ===================== Configuration =====================
+class Config:
+    CSV_ORIGIN_DIR = "/home/kdk"
+    CSV_DIR = "/home/kdk/winshare/PJT4"
+    SAVE_DIR_BASE = "/home/kdk/winshare/PJT4"
+    POT_ARDUINO_PORT = '/dev/rfcomm0'
+    CAR_ARDUINO_PORT = '/dev/ttyACM0'
+    BAUD_RATE = 9600
+    POT_COUNT = 3
+    CAMERA_DEVICE = 0
+
+config = Config()
+
+# ===================== Camera Initialization =====================
+cap = cv2.VideoCapture(config.CAMERA_DEVICE)
+if not cap.isOpened():
+    print("[Error] Camera not found")
+    cap = None
+else:
+    print("[Info] Camera connected")
+
+# Create folder for each pot
+for i in range(1, config.POT_COUNT+1):
+    pot_dir = os.path.join(config.SAVE_DIR_BASE, str(i))
+    os.makedirs(pot_dir, exist_ok=True)
+
+def capture_image(pot_no):
+    if not cap:
+        return
+    ret, frame = cap.read()
+    if ret:
+        filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        filepath = os.path.join(config.SAVE_DIR_BASE, str(pot_no), filename)
+        cv2.imwrite(filepath, frame)
+        print(f"[Saved] Pot {pot_no}: {filepath}")
+    else:
+        print("[Error] Failed to capture frame")
+# ===================== CSV Handling =====================
+def get_origin_csv_path():
+    today = datetime.now()
+    os.makedirs(config.CSV_ORIGIN_DIR, exist_ok=True)
+    filename = f"PJT_{today.strftime('%Y%m%d')}.csv"
+    return os.path.join(config.CSV_ORIGIN_DIR, filename)
+
+def copy_to_share(origin_path):
+    os.makedirs(config.CSV_DIR, exist_ok=True)
+    dest_path = os.path.join(config.CSV_DIR, os.path.basename(origin_path))
+    shutil.copy2(origin_path, dest_path)
+
+def get_csv_path():
+    today = datetime.now()
+    os.makedirs(config.CSV_DIR, exist_ok=True)
+    filename = f"PJT_{today.strftime('%Y%m%d')}.csv"
+    return os.path.join(config.CSV_DIR, filename)
+
+# Create initial CSV if not exist
+csv_path = get_csv_path()
+if not os.path.exists(csv_path):
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['TIME','P1','P2','P3','TEMP','HUM','LUX','WATER','WATERLIST','FAN','DOOR','BIRD','NEO'])
+
+# ===================== Serial Connection =====================
+def connect_serial(port, baud):
+    try:
+        ser = serial.Serial(port, baud, timeout=0.1)
+        print(f"[Serial Connected] {port}")
+        return ser
+    except Exception as e:
+        print(f"[Serial Failed] {port}: {e}")
+        return None
+
+pot_serial = connect_serial(config.POT_ARDUINO_PORT, config.BAUD_RATE)
+car_serial = connect_serial(config.CAR_ARDUINO_PORT, config.BAUD_RATE)
+
+# ===================== Weather Data =====================
+last_weather_time = 0
+last_weather_data = "Weather data not available"
+
+def get_weather():
+    global last_weather_time, last_weather_data
+    now = time.time()
+    if now - last_weather_time > 600:
+        try:
+            API_KEY = "e2c3c6b170803a66050ae517d5308d16"
+            CITY = "Seoul,KR"
+            URL = f"https://api.openweathermap.org/data/2.5/weather?q={CITY}&appid={API_KEY}&units=metric&lang=en"
+
+            res = requests.get(URL, timeout=10)
+            res.raise_for_status()
+            data = res.json()
+
+            temp = data.get("main", {}).get("temp", "N/A")
+            desc = data.get("weather", [{}])[0].get("description", "No info")
+            city = CITY.split(',')[0]
+
+            last_weather_data = f"{city} {temp}C, {desc}"
+
+        except Exception as e:
+            last_weather_data = f"Weather error: {e}"
+        last_weather_time = now
+    return last_weather_data
+
+# ===================== Arduino Reading & CSV Save =====================
+last_csv_time = 0
+last_auto_move_time = 0
+AUTO_MOVE_INTERVAL = 5*60
+
+def read_arduino(ser):
+    global last_csv_time, last_auto_move_time
+    while True:
+        now = time.time()
+        if ser and ser.is_open and ser.in_waiting > 0:
+            try:
+                line = ser.readline().decode(errors='ignore').strip()
+                if line:
+                    if line.startswith("WATER:"):
+                        print("[Arduino -> Raspberry]", line)
+                        try:
+                            pot_no = int(line.split(":")[1])
+                            if 1 <= pot_no <= config.POT_COUNT:
+                                capture_image(pot_no)
+                        except ValueError:
+                            print("[Warning] Invalid pot number:", line)
+
+                    parts = line.split()
+                    for p in parts:
+                        if ':' in p:
+                            key, val = p.split(':', 1)
+                            key = key.strip()
+                            val = val.strip()
+                            if key in sensor_data and key != "WATERLIST":
+                                try:
+                                    sensor_data[key] = int(val) if key in ['P1','P2','P3'] else float(val)
+                                except:
+                                    sensor_data[key] = 0
+                            elif key in arduino_status:
+                                arduino_status[key] = val
+                            elif key == "WATERLIST":
+                                sensor_data['WATERLIST'] = val if val else "STOP"
+
+                if not sensor_data['WATERLIST']:
+                    sensor_data['WATERLIST'] = "STOP"
+
+                if sensor_data['WATERLIST'] != "STOP":
+                    if now - last_auto_move_time >= AUTO_MOVE_INTERVAL:
+                        items = [x for x in sensor_data['WATERLIST'].split(',') if x.isdigit()]
+                        if items:
+                            cmd_str = "MOVE:" + ",".join(items) + ",0\n"
+                            if car_serial and car_serial.is_open:
+                                car_serial.write(cmd_str.encode())
+                            last_auto_move_time = now
+                            print(f"[AUTO MOVE Command Sent] {cmd_str.strip()}")
+
+            except Exception as e:
+                print(f"[Read Error] {e}")
+
+        for dev in relay_status:
+            relay_status[dev] = web_status[dev] if web_status[dev] != 'AUTO' else arduino_status[dev]
+
+        if now - last_csv_time >= 3:
+            last_csv_time = now
+            origin_path = get_origin_csv_path()
+            if not os.path.exists(origin_path):
+                with open(origin_path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['TIME','P1','P2','P3','TEMP','HUM','LUX','WATER','WATERLIST','FAN','DOOR','BIRD','NEO'])
+            with open(origin_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                row = [
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    sensor_data['P1'],
+                    sensor_data['P2'],
+                    sensor_data['P3'],
+                    sensor_data['TEMP'],
+                    sensor_data['HUM'],
+                    sensor_data['LUX'],
+                    sensor_data['WATER'],
+                    sensor_data['WATERLIST'],
+                    relay_status['FAN'],
+                    relay_status['DOOR'],
+                    relay_status['BIRD'],
+                    relay_status['NEO']
+                ]
+                writer.writerow(row)
+            copy_to_share(origin_path)
+
+        time.sleep(0.05)
+
+
+
+# ===================== Web Dashboard =====================
+dashboard_html = """<!DOCTYPE html>
+<html>
+<head>
+<title>Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<style>
+body { font-family: Arial; background-color: #f5f5f5; margin:0; padding:0; }
+h2,h3{ margin-top:20px; text-align:center; }
+table{ border-collapse: collapse; margin:20px auto; background:white; box-shadow:0 0 10px rgba(0,0,0,0.1);}
+th,td{ border:1px solid #ccc; padding:10px; text-align:center;}
+th{ background:#4CAF50; color:white;}
+td button{ display:block; margin:5px auto; padding:8px 12px; width:100px; border:none; border-radius:4px; color:white; cursor:pointer;}
+.ON{ background:green;} .OFF{ background:red;} .AUTO{ background:gray;} .MOVE{ background:orange;}
+.dashboard-container{ display:flex; justify-content:space-between; padding:20px;}
+.left-panel{ width:60%; } .right-panel{ width:35%; background:#f0f0f0; padding:15px; border-radius:8px;}
+.chart-box{ margin-bottom:20px; padding:10px; background:white; border-radius:6px; box-shadow:0 0 5px rgba(0,0,0,0.1);}
+</style>
+</head>
+<body>
+<div class="dashboard-container">
+    <div class="left-panel">
+        <h2>Weather</h2>
+        <table>
+        <tr><th>Time</th><th>City</th><th>Temp</th><th>Description</th></tr>
+        <tr><td>{{current_time}}</td><td>{{city}}</td><td>{{temp}}</td><td>{{desc}}</td></tr>
+        </table>
+
+        <h2>Sensor Data</h2>
+        <table>
+        <tr><th>P1</th><th>P2</th><th>P3</th><th>TEMP</th><th>HUM</th><th>LUX</th><th>WATER</th></tr>
+        <tr><td id="P1">{{P1}}</td><td id="P2">{{P2}}</td><td id="P3">{{P3}}</td>
+            <td id="TEMP">{{TEMP}}</td><td id="HUM">{{HUM}}</td><td id="LUX">{{LUX}}</td><td id="WATER">{{WATER}}</td></tr>
+        </table>
+
+        <h2>Device Control</h2>
+        <table>
+        <tr>
+            <th>Device</th><th>ON</th><th>OFF</th><th>AUTO</th><th>Status</th>
+        </tr>
+        {% for dev in relay_status %}
+        <tr>
+            <td>{{dev}}</td>
+            <td><a href="{{url_for('control', device=dev, action='ON')}}"><button class="ON">ON</button></a></td>
+            <td><a href="{{url_for('control', device=dev, action='OFF')}}"><button class="OFF">OFF</button></a></td>
+            <td><a href="{{url_for('control', device=dev, action='AUTO')}}"><button class="AUTO">AUTO</button></a></td>
+            <td>{{relay_status[dev]}}</td>
+        </tr>
+        {% endfor %}
+        </table>
+
+        <h2>Move Commands</h2>
+        <table>
+        <tr>
+            <th>Command</th><th>Action</th>
+        </tr>
+        <tr>
+            <td>MOVE 1</td>
+            <td><a href="{{url_for('move_cmd', pots='1')}}"><button class="MOVE">MOVE 1</button></a></td>
+        </tr>
+        <tr>
+            <td>MOVE 1,3</td>
+            <td><a href="{{url_for('move_cmd', pots='1,3')}}"><button class="MOVE">MOVE 1,3</button></a></td>
+        </tr>
+        <tr>
+            <td>MOVE 1,2,3</td>
+            <td><a href="{{url_for('move_cmd', pots='1,2,3')}}"><button class="MOVE">MOVE 1,2,3</button></a></td>
+        </tr>
+        </table>
+
+    </div>
+
+    <div class="right-panel">
+        <h3>Pots P1/P2/P3</h3><div class="chart-box"><canvas id="potChart"></canvas></div>
+        <h3>TEMP</h3><div class="chart-box"><canvas id="tempChart"></canvas></div>
+        <h3>HUM</h3><div class="chart-box"><canvas id="humChart"></canvas></div>
+        <h3>LUX</h3><div class="chart-box"><canvas id="luxChart"></canvas></div>
+    </div>
+</div>
+
+<script>
+let potData = {P1:[{{P1}}], P2:[{{P2}}], P3:[{{P3}}]};
+let tempData = [{{TEMP}}];
+let humData = [{{HUM}}];
+let luxData = [{{LUX}}];
+const labels = ["0s"];
+
+const potChart = new Chart(document.getElementById('potChart'), {
+    type:'line',
+    data:{ labels: labels, datasets:[
+        {label:'P1', data: potData.P1, borderColor:'red', fill:false},
+        {label:'P2', data: potData.P2, borderColor:'blue', fill:false},
+        {label:'P3', data: potData.P3, borderColor:'green', fill:false}
+    ]},
+    options:{responsive:true, plugins:{legend:{position:'bottom'}}}
+});
+
+const tempChart = new Chart(document.getElementById('tempChart'), { 
+    type:'line', 
+    data:{ labels: labels, datasets:[{label:'TEMP', data: tempData, borderColor:'red', fill:false}]}, 
+    options:{responsive:true} 
+});
+const humChart = new Chart(document.getElementById('humChart'), { 
+    type:'line', 
+    data:{ labels: labels, datasets:[{label:'HUM', data: humData, borderColor:'blue', fill:false}]}, 
+    options:{responsive:true} 
+});
+const luxChart = new Chart(document.getElementById('luxChart'), { 
+    type:'line', 
+    data:{ labels: labels, datasets:[{label:'LUX', data: luxData, borderColor:'green', fill:false}]}, 
+    options:{responsive:true} 
+});
+
+function updateData(){
+    $.getJSON('/sensor_data', function(data){
+        $('#P1').text(data.P1); $('#P2').text(data.P2); $('#P3').text(data.P3);
+        $('#TEMP').text(data.TEMP); $('#HUM').text(data.HUM); $('#LUX').text(data.LUX);
+        $('#WATER').text(data.WATER);
+
+        labels.push(new Date().toLocaleTimeString());
+        if(labels.length>20) labels.shift();
+
+        potData.P1.push(data.P1); potData.P2.push(data.P2); potData.P3.push(data.P3);
+        tempData.push(data.TEMP); humData.push(data.HUM); luxData.push(data.LUX);
+        if(potData.P1.length>20){ potData.P1.shift(); potData.P2.shift(); potData.P3.shift(); tempData.shift(); humData.shift(); luxData.shift(); }
+
+        potChart.update(); tempChart.update(); humChart.update(); luxChart.update();
+    });
+}
+
+setInterval(updateData, 2000);
+</script>
+</body>
+</html>
+"""
+
+
+# ===================== Flask route for JSON =====================
+@app.route('/sensor_data')
+def sensor_data_json():
+    return {
+        'P1': sensor_data['P1'],
+        'P2': sensor_data['P2'],
+        'P3': sensor_data['P3'],
+        'TEMP': sensor_data['TEMP'],
+        'HUM': sensor_data['HUM'],
+        'LUX': sensor_data['LUX'],
+        'WATER': sensor_data['WATER']
+    }
+
+
+
+
+@app.route('/move/<pots>')
+def move_cmd(pots):
+  
+    cmd = f"MOVE:{pots}\n"
+    if car_serial and car_serial.is_open:
+        car_serial.write(cmd.encode())
+    print(f"[MOVE Command Sent via USB] {cmd.strip()}")
+    return redirect(url_for('index'))
+
+@app.route('/')
+def index():
+    weather_info = get_weather()
+    try:
+        parts = weather_info.split()
+        city = parts[0]
+        temp = parts[1]
+        desc = " ".join(parts[2:]).strip(",")
+    except:
+        city = temp = desc = "N/A"
+
+    return render_template_string(
+        dashboard_html,
+        current_time=time.strftime("%p %I:%M"),
+        city=city,
+        temp=temp,
+        desc=desc,
+        **sensor_data,
+        relay_status=relay_status
+    )
+
+@app.route('/control/<device>/<action>')
+def control(device,action):
+    if device in web_status:
+        web_status[device] = action
+        cmd = f"{device}_{action}\n"
+        if pot_serial and pot_serial.is_open: pot_serial.write(cmd.encode())
+        if car_serial and car_serial.is_open: car_serial.write(cmd.encode())
+    return redirect(url_for('index'))
+
+if __name__=='__main__':
+    if pot_serial:
+        threading.Thread(target=read_arduino, args=(pot_serial,), daemon=True).start()
+    if car_serial:
+        threading.Thread(target=read_arduino, args=(car_serial,), daemon=True).start()
+    app.run(host='0.0.0.0', port=5000)
